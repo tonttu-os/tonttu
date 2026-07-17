@@ -1,0 +1,101 @@
+---
+# Builds the ES-DE RPM from the pinned upstream release tarball declared in
+# packaging/es-de/es-de.spec, then verifies it installs and runs in a clean
+# fedora:42 container. The RPM is uploaded as a workflow artifact for
+# consumption by the image build.
+#
+# Plain rpmbuild inside a fedora:42 container is used instead of mock: the
+# throwaway container already provides the clean build root mock exists to
+# create, and mock needs privileged/nested-chroot setups that are awkward on
+# GitHub-hosted runners.
+name: Build ES-DE RPM
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'packaging/es-de/**'
+      - '.github/workflows/es-de-rpm.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'packaging/es-de/**'
+      - '.github/workflows/es-de-rpm.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build RPM (fedora:42)
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:42
+    steps:
+      - name: Install build tooling
+        run: |
+          dnf -y install git-core rpm-build rpmdevtools 'dnf5-command(builddep)'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install BuildRequires from stock Fedora repos
+        run: |
+          dnf -y builddep packaging/es-de/es-de.spec
+
+      - name: Fetch pinned source tarball
+        run: |
+          mkdir -p rpmbuild/SOURCES
+          spectool -g -C rpmbuild/SOURCES packaging/es-de/es-de.spec
+
+      - name: Verify source checksum
+        working-directory: rpmbuild/SOURCES
+        run: |
+          sha256sum -c "${GITHUB_WORKSPACE}/packaging/es-de/sources.sha256"
+
+      - name: Build RPM
+        run: |
+          rpmbuild -ba \
+            --define "_topdir ${PWD}/rpmbuild" \
+            packaging/es-de/es-de.spec
+
+      - name: Collect packages
+        run: |
+          mkdir -p dist
+          cp rpmbuild/RPMS/*/es-de-*.rpm dist/
+          cp rpmbuild/SRPMS/es-de-*.src.rpm dist/
+          ls -l dist/
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: es-de-rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  install-test:
+    name: Install test in clean fedora:42
+    needs: build
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:42
+    steps:
+      - name: Download RPM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: es-de-rpm
+          path: dist
+
+      - name: Install RPM from stock repos only
+        run: |
+          dnf -y install ./dist/es-de-[0-9]*.x86_64.rpm
+
+      - name: Verify installed binary and pinned version
+        run: |
+          test -x /usr/bin/es-de
+          /usr/bin/es-de --version
+          /usr/bin/es-de --version | grep -F 'ES-DE 3.4.1'
